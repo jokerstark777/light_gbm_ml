@@ -39,6 +39,12 @@ def parse_args():
         help="Number of bars to embargo between train/val/test splits.",
     )
     parser.add_argument(
+        "--timeframe",
+        type=str,
+        default=getattr(cfg, "TIMEFRAME", "1h"),
+        help="Chart timeframe string (e.g., '1h', '1d') for time-based embargo calculation.",
+    )
+    parser.add_argument(
         "--predictions-name",
         default="walk_forward_oos_predictions",
         help="Base filename for saved OOS predictions and backtest artifacts.",
@@ -90,12 +96,20 @@ def fit_fold_model(train_df: pd.DataFrame, feature_columns: list[str], seed: int
 
     if len(x_train) >= 20:
         internal_eval_size = max(1, int(len(x_train) * 0.15))
-        train_part_y = y_train.iloc[:-internal_eval_size]
-        if internal_eval_size < len(x_train) and train_part_y.nunique(dropna=True) >= 2:
+        # Apply embargo gap to prevent lookahead bias from forward-looking target labels
+        purge_gap = int(getattr(cfg, "WF_EMBARGO_BARS", getattr(cfg, "HORIZON", 16)))
+        train_cutoff = -internal_eval_size - purge_gap
+        
+        x_train_fit = x_train.iloc[:train_cutoff]
+        y_train_fit = y_train.iloc[:train_cutoff]
+        x_eval = x_train.iloc[-internal_eval_size:]
+        y_eval = y_train.iloc[-internal_eval_size:]
+        
+        if len(x_train_fit) >= 10 and y_train_fit.nunique(dropna=True) >= 2:
             model.fit(
-                x_train.iloc[:-internal_eval_size],
-                train_part_y,
-                eval_set=[(x_train.iloc[-internal_eval_size:], y_train.iloc[-internal_eval_size:])],
+                x_train_fit,
+                y_train_fit,
+                eval_set=[(x_eval, y_eval)],
                 eval_metric="binary_logloss",
                 categorical_feature=categorical_feature,
                 callbacks=[
@@ -139,6 +153,7 @@ def build_walk_forward_predictions(
         wf_test_months=args.wf_test_months,
         wf_step_months=args.wf_step_months,
         wf_embargo_bars=args.wf_embargo_bars,
+        timeframe=args.timeframe,
     )
     
     # Use the same walk-forward split logic as train.py
@@ -215,6 +230,7 @@ def save_walk_forward_payload(predictions: pd.DataFrame, fold_details: list[dict
         "wf_test_months": int(args.wf_test_months),
         "wf_step_months": int(args.wf_step_months),
         "wf_embargo_bars": int(args.wf_embargo_bars),
+        "timeframe": str(args.timeframe),
         "entry_threshold": float(args.entry_threshold),
         "prediction_rows": int(len(predictions)),
         "prediction_period": {

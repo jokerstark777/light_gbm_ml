@@ -183,6 +183,12 @@ def parse_args():
         help="Number of unique timestamps to skip between train/validation and validation/test windows.",
     )
     parser.add_argument(
+        "--timeframe",
+        type=str,
+        default=getattr(cfg, "TIMEFRAME", "1h"),
+        help="Chart timeframe string (e.g., '1h', '1d') for time-based embargo calculation.",
+    )
+    parser.add_argument(
         "--model-name",
         default=getattr(cfg, "MODEL_NAME", "lightgbm_long_only"),
         help="Base filename for saved artifacts.",
