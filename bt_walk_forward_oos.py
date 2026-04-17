@@ -2,15 +2,16 @@ import argparse
 from collections import Counter
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import TimeSeriesSplit
 
 import bt as runtime_bt
 import config as cfg
 import train
+from src.utils.validation import generate_walk_forward_splits
 from bt_walk_forward import load_runtime_inputs, plot_equity_curve
 from execution_engine import EngineLogConfig, EntrySignal, simulate_portfolio
 from signal_filter import build_event_gate_mask, resolve_event_filter_config
@@ -23,12 +24,19 @@ def parse_args():
     parser.add_argument("--db-path", default=cfg.DB_PATH, help="Path to SQLite database.")
     parser.add_argument("--symbols", nargs="+", default=cfg.SYMBOLS, help="Symbols to load.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--n-splits", type=int, default=5, help="Number of walk-forward folds.")
+    parser.add_argument("--wf-train-months", type=int, default=getattr(cfg, "WF_TRAIN_MONTHS", 6), 
+                        help="Training window size in months for walk-forward splits.")
+    parser.add_argument("--wf-val-months", type=int, default=getattr(cfg, "WF_VAL_MONTHS", 1), 
+                        help="Validation window size in months for walk-forward splits.")
+    parser.add_argument("--wf-test-months", type=int, default=getattr(cfg, "WF_TEST_MONTHS", 1), 
+                        help="Test window size in months for walk-forward splits.")
+    parser.add_argument("--wf-step-months", type=int, default=getattr(cfg, "WF_STEP_MONTHS", 1), 
+                        help="Step size between folds in months for walk-forward splits.")
     parser.add_argument(
-        "--purge-gap",
+        "--wf-embargo-bars",
         type=int,
         default=int(getattr(cfg, "WF_EMBARGO_BARS", getattr(cfg, "HORIZON", 0))),
-        help="Purge gap in unique timestamps between train and test folds.",
+        help="Number of bars to embargo between train/val/test splits.",
     )
     parser.add_argument(
         "--predictions-name",
@@ -108,47 +116,54 @@ def build_walk_forward_predictions(
     full_frame: pd.DataFrame,
     candidate_frame: pd.DataFrame,
     feature_columns: list[str],
-    n_splits: int,
-    purge_gap: int,
-    seed: int,
+    args,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    if n_splits <= 1:
-        raise ValueError("--n-splits must be > 1.")
-    if purge_gap < 0:
-        raise ValueError("--purge-gap must be >= 0.")
-
-    unique_ts = np.sort(full_frame[train.TIMESTAMP_COLUMN].dropna().unique())
-    if len(unique_ts) < n_splits + 1:
-        raise RuntimeError(
-            f"Only {len(unique_ts)} unique timestamps, need at least {n_splits + 1} for {n_splits} folds."
-        )
-
+    """Generate walk-forward predictions using time-based splits consistent with train.py.
+    
+    Args:
+        full_frame: Full dataset for generating splits.
+        candidate_frame: Candidate frame for training and testing.
+        feature_columns: List of feature column names.
+        args: Parsed arguments containing walk-forward configuration.
+    
+    Returns:
+        Tuple of (predictions DataFrame, fold_details list).
+    
+    Raises:
+        RuntimeError: If no valid folds can be generated.
+    """
+    # Create a SimpleNamespace to match the expected args interface in generate_walk_forward_splits
+    wf_args = SimpleNamespace(
+        wf_train_months=args.wf_train_months,
+        wf_val_months=args.wf_val_months,
+        wf_test_months=args.wf_test_months,
+        wf_step_months=args.wf_step_months,
+        wf_embargo_bars=args.wf_embargo_bars,
+    )
+    
+    # Use the same walk-forward split logic as train.py
+    folds = generate_walk_forward_splits(full_frame, wf_args)
+    
     predictions = []
     fold_details = []
-    splitter = TimeSeriesSplit(n_splits=n_splits)
-    for fold_idx, (train_ts_idx, test_ts_idx) in enumerate(splitter.split(unique_ts), start=1):
-        train_timestamps = unique_ts[train_ts_idx]
-        test_timestamps = unique_ts[test_ts_idx]
-
-        purged_count = 0
-        if purge_gap > 0:
-            purged_count = min(int(purge_gap), len(train_timestamps))
-            train_timestamps = train_timestamps[:-purged_count] if purged_count else train_timestamps
-
-        train_df = candidate_frame.loc[candidate_frame[train.TIMESTAMP_COLUMN].isin(set(train_timestamps))].copy()
-        test_df = candidate_frame.loc[candidate_frame[train.TIMESTAMP_COLUMN].isin(set(test_timestamps))].copy()
+    
+    for fold_data in folds:
+        fold_idx = fold_data["fold_id"]
+        train_df = fold_data["train_df"]
+        test_df = fold_data["test_df"]
+        
         train_classes = sorted(train_df[train.TARGET_COLUMN].dropna().astype(int).unique().tolist())
         if train_df.empty or test_df.empty or len(train_classes) < 2:
             print(f"Fold {fold_idx}: skipped (train={len(train_df)}, test={len(test_df)}, classes={train_classes})")
             continue
-
-        model, clip_bounds, active_feature_columns = fit_fold_model(train_df, feature_columns, seed + fold_idx)
+        
+        model, clip_bounds, active_feature_columns = fit_fold_model(train_df, feature_columns, args.seed + fold_idx)
         clipped_test = train.apply_feature_clip_bounds(test_df, clip_bounds)
         clipped_test = clipped_test.dropna(subset=active_feature_columns + [train.TARGET_COLUMN])
         if clipped_test.empty:
             print(f"Fold {fold_idx}: skipped after feature NaN cleanup")
             continue
-
+        
         proba = model.predict_proba(clipped_test[active_feature_columns])
         fold_predictions = pd.DataFrame(
             {
@@ -162,12 +177,11 @@ def build_walk_forward_predictions(
         )
         fold_predictions["y_pred"] = (fold_predictions["p_long"] >= 0.5).astype(int)
         predictions.append(fold_predictions)
-
+        
         fold_info = {
             "fold": int(fold_idx),
             "train_rows": int(len(train_df)),
             "prediction_rows": int(len(fold_predictions)),
-            "purged_timestamps": int(purged_count),
             "train_start": str(train_df[train.TIMESTAMP_COLUMN].min()),
             "train_end": str(train_df[train.TIMESTAMP_COLUMN].max()),
             "test_start": str(clipped_test[train.TIMESTAMP_COLUMN].min()),
@@ -177,11 +191,11 @@ def build_walk_forward_predictions(
         }
         fold_details.append(fold_info)
         print(
-            f"Fold {fold_idx}/{n_splits}: train={fold_info['train_rows']} "
+            f"Fold {fold_idx}: train={fold_info['train_rows']} "
             f"pred={fold_info['prediction_rows']} "
             f"[{fold_info['test_start']} -> {fold_info['test_end']}]"
         )
-
+    
     if not predictions:
         raise RuntimeError("All walk-forward folds were skipped.")
     return pd.concat(predictions, ignore_index=True), fold_details
@@ -196,8 +210,11 @@ def save_walk_forward_payload(predictions: pd.DataFrame, fold_details: list[dict
     summary = {
         "run_timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "symbols": list(args.symbols),
-        "n_splits": int(args.n_splits),
-        "purge_gap": int(args.purge_gap),
+        "wf_train_months": int(args.wf_train_months),
+        "wf_val_months": int(args.wf_val_months),
+        "wf_test_months": int(args.wf_test_months),
+        "wf_step_months": int(args.wf_step_months),
+        "wf_embargo_bars": int(args.wf_embargo_bars),
         "entry_threshold": float(args.entry_threshold),
         "prediction_rows": int(len(predictions)),
         "prediction_period": {
@@ -440,9 +457,7 @@ def main():
         full_frame=full_frame,
         candidate_frame=candidate_frame,
         feature_columns=feature_columns,
-        n_splits=args.n_splits,
-        purge_gap=args.purge_gap,
-        seed=args.seed,
+        args=args,
     )
     summary = save_walk_forward_payload(predictions, fold_details, args)
     backtest_result = run_predictions_backtest(
