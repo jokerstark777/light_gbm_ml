@@ -8,6 +8,29 @@ TIMESTAMP_COLUMN = "timestamp"
 TARGET_COLUMN = "target_long_label"
 
 
+def compute_embargo_timedelta(horizon_bars: int, timeframe: str) -> pd.Timedelta:
+    """Compute a time-based embargo duration from horizon bars and timeframe.
+    
+    Args:
+        horizon_bars: Number of bars in the forecast horizon (e.g., HORIZON config).
+        timeframe: The chart timeframe string (e.g., "1h", "1d", "15m").
+    
+    Returns:
+        pd.Timedelta representing the embargo duration.
+    """
+    if "d" in timeframe:
+        return pd.Timedelta(days=horizon_bars)
+    elif "h" in timeframe:
+        return pd.Timedelta(hours=horizon_bars)
+    elif "m" in timeframe:
+        return pd.Timedelta(minutes=horizon_bars)
+    elif "s" in timeframe:
+        return pd.Timedelta(seconds=horizon_bars)
+    else:
+        # Default to hours if timeframe is unrecognized
+        return pd.Timedelta(hours=horizon_bars)
+
+
 def validate_walk_forward_args(args: Any) -> None:
     """Validate walk-forward configuration arguments.
     
@@ -60,6 +83,8 @@ def generate_walk_forward_splits(dataset: pd.DataFrame, args: Any) -> list[dict]
             - wf_test_months: Test window size in months
             - wf_step_months: Step size between folds in months
             - wf_embargo_bars: Number of bars to embargo between splits
+            - timeframe: Optional chart timeframe string (e.g., "1h", "1d") for time-based embargo.
+                         If provided, embargo is computed as timedelta instead of index offset.
     
     Returns:
         List of fold dictionaries containing train_df, valid_df, test_df, and metadata.
@@ -79,6 +104,13 @@ def generate_walk_forward_splits(dataset: pd.DataFrame, args: Any) -> list[dict]
     cursor_ts = first_ts
     folds = []
     fold_id = 1
+    
+    # Determine if we should use time-based embargo (preferred) or index-based embargo
+    timeframe = getattr(args, "timeframe", None)
+    use_time_based_embargo = timeframe is not None
+    
+    if use_time_based_embargo:
+        embargo_timedelta = compute_embargo_timedelta(int(args.wf_embargo_bars), timeframe)
 
     while True:
         train_start_boundary = cursor_ts
@@ -87,7 +119,15 @@ def generate_walk_forward_splits(dataset: pd.DataFrame, args: Any) -> list[dict]
         if train_end_idx_exclusive is None or train_end_idx_exclusive <= 0:
             break
 
-        val_start_idx = train_end_idx_exclusive + int(args.wf_embargo_bars)
+        # Compute validation start using either time-based or index-based embargo
+        if use_time_based_embargo:
+            val_start_boundary = unique_timestamps.iloc[train_end_idx_exclusive] + embargo_timedelta
+            val_start_idx = resolve_timestamp_index_on_or_after(unique_timestamps, pd.Timestamp(val_start_boundary))
+            if val_start_idx is None:
+                break
+        else:
+            val_start_idx = train_end_idx_exclusive + int(args.wf_embargo_bars)
+        
         if val_start_idx >= len(unique_timestamps):
             break
         val_start_ts = pd.Timestamp(unique_timestamps.iloc[val_start_idx])
@@ -96,7 +136,15 @@ def generate_walk_forward_splits(dataset: pd.DataFrame, args: Any) -> list[dict]
         if val_end_idx_exclusive is None or val_end_idx_exclusive <= val_start_idx:
             break
 
-        test_start_idx = val_end_idx_exclusive + int(args.wf_embargo_bars)
+        # Compute test start using either time-based or index-based embargo
+        if use_time_based_embargo:
+            test_start_boundary = unique_timestamps.iloc[val_end_idx_exclusive] + embargo_timedelta
+            test_start_idx = resolve_timestamp_index_on_or_after(unique_timestamps, pd.Timestamp(test_start_boundary))
+            if test_start_idx is None:
+                break
+        else:
+            test_start_idx = val_end_idx_exclusive + int(args.wf_embargo_bars)
+        
         if test_start_idx >= len(unique_timestamps):
             break
         test_start_ts = pd.Timestamp(unique_timestamps.iloc[test_start_idx])
