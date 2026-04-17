@@ -91,39 +91,51 @@ def fit_fold_model(train_df: pd.DataFrame, feature_columns: list[str], seed: int
 
     x_train = clipped_train[active_feature_columns]
     y_train = clipped_train[train.TARGET_COLUMN].astype(int)
+    
+    # Build model with same hyperparameters as train.py, including class_weight for imbalance handling
     model = train.build_model(seed=seed)
     categorical_feature = [train.SYMBOL_COLUMN] if train.SYMBOL_COLUMN in active_feature_columns else "auto"
 
     if len(x_train) >= 20:
         internal_eval_size = max(1, int(len(x_train) * 0.15))
         # Apply embargo gap to prevent lookahead bias from forward-looking target labels
+        # The last HORIZON rows of training data have labels that look into the future,
+        # so we must exclude them from both training and evaluation sets
         purge_gap = int(getattr(cfg, "WF_EMBARGO_BARS", getattr(cfg, "HORIZON", 16)))
-        train_cutoff = -internal_eval_size - purge_gap
         
-        x_train_fit = x_train.iloc[:train_cutoff]
-        y_train_fit = y_train.iloc[:train_cutoff]
-        x_eval = x_train.iloc[-internal_eval_size:]
-        y_eval = y_train.iloc[-internal_eval_size:]
+        # First, remove the purge_gap from the end of training data to eliminate lookahead bias
+        train_safe_cutoff = -internal_eval_size - purge_gap
         
-        if len(x_train_fit) >= 10 and y_train_fit.nunique(dropna=True) >= 2:
-            model.fit(
-                x_train_fit,
-                y_train_fit,
-                eval_set=[(x_eval, y_eval)],
-                eval_metric="binary_logloss",
-                categorical_feature=categorical_feature,
-                callbacks=[
-                    lgb.early_stopping(
-                        stopping_rounds=int(getattr(cfg, "LGBM_EARLY_STOPPING_ROUNDS", 50)),
-                        verbose=False,
-                    ),
-                    lgb.log_evaluation(period=0),
-                ],
-            )
-            return model, clip_bounds, active_feature_columns
+        # Check if we have enough data after applying embargo
+        if len(x_train) + train_safe_cutoff >= 10:
+            x_train_fit = x_train.iloc[:train_safe_cutoff]
+            y_train_fit = y_train.iloc[:train_safe_cutoff]
+            x_eval = x_train.iloc[-internal_eval_size:]
+            y_eval = y_train.iloc[-internal_eval_size:]
+            
+            if len(x_train_fit) >= 10 and y_train_fit.nunique(dropna=True) >= 2:
+                model.fit(
+                    x_train_fit,
+                    y_train_fit,
+                    eval_set=[(x_eval, y_eval)],
+                    eval_metric="binary_logloss",
+                    categorical_feature=categorical_feature,
+                    callbacks=[
+                        lgb.early_stopping(
+                            stopping_rounds=int(getattr(cfg, "LGBM_EARLY_STOPPING_ROUNDS", 50)),
+                            verbose=False,
+                        ),
+                        lgb.log_evaluation(period=0),
+                    ],
+                )
+                return model, clip_bounds, active_feature_columns
 
-    model.fit(x_train, y_train, categorical_feature=categorical_feature)
-    return model, clip_bounds, active_feature_columns
+    # Fallback: train on all available data if not enough for split
+    if len(x_train) >= 10 and y_train.nunique(dropna=True) >= 2:
+        model.fit(x_train, y_train, categorical_feature=categorical_feature)
+        return model, clip_bounds, active_feature_columns
+    
+    raise RuntimeError(f"Insufficient training data: {len(x_train)} rows, {y_train.nunique()} classes")
 
 
 def build_walk_forward_predictions(
