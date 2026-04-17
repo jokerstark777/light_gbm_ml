@@ -67,10 +67,30 @@ def estimate_long_stop_loss_pct(stop_pct: float, config: ExecutionConfig) -> flo
 
 
 def compute_trade_outcome(position: dict, exit_price: float, config: ExecutionConfig) -> tuple[float, float, float]:
-    pnl_clean = compute_net_pnl_pct(position["entry"], exit_price, config.taker_com)
+    """Compute trade PnL including slippage (already in exit_price) and commissions.
+    
+    Args:
+        position: Dict with 'entry' price and 'size' (position notional)
+        exit_price: Exit price (should already include slippage adjustment)
+        config: Execution configuration
+        
+    Returns:
+        Tuple of (pnl_pct after fees, absolute PnL, commission amount)
+    """
+    # Raw price-based PnL percentage (exit_price should already include slippage)
+    raw_pnl_pct = (exit_price - position["entry"]) / position["entry"]
+    
+    # Commission is based on position notional (both entry and exit)
     position_notional = float(position["size"])
     commission = position_notional * (config.taker_com + config.taker_com)
-    trade_profit = position_notional * pnl_clean
+    
+    # Absolute PnL from price movement minus commission
+    gross_pnl = position_notional * raw_pnl_pct
+    trade_profit = gross_pnl - commission
+    
+    # Net PnL percentage relative to position notional
+    pnl_clean = trade_profit / position_notional if position_notional > 0 else 0.0
+    
     return pnl_clean, trade_profit, commission
 
 
@@ -80,6 +100,17 @@ def compute_portfolio_equity(
     mark_prices: dict[str, float],
     config: ExecutionConfig,
 ) -> float:
+    """Compute portfolio equity including unrealized PnL and accounting for commissions.
+    
+    Args:
+        balance: Current cash balance
+        positions: Dict of open positions
+        mark_prices: Current mark prices for each symbol
+        config: Execution configuration
+        
+    Returns:
+        Total equity (balance + unrealized PnL)
+    """
     equity = float(balance)
     for symbol, position in positions.items():
         if position is None:
@@ -87,8 +118,19 @@ def compute_portfolio_equity(
         mark_price = mark_prices.get(symbol)
         if mark_price is None or not np.isfinite(mark_price):
             continue
-        pnl_clean = compute_net_pnl_pct(position["entry"], float(mark_price), config.taker_com)
-        equity += float(position["size"]) * pnl_clean
+        
+        # Raw price-based PnL percentage
+        raw_pnl_pct = (float(mark_price) - position["entry"]) / position["entry"]
+        
+        # Commission already paid at entry (and would be paid at exit)
+        position_notional = float(position["size"])
+        commission = position_notional * (config.taker_com + config.taker_com)
+        
+        # Unrealized PnL from price movement minus commission (already paid)
+        gross_unrealized = position_notional * raw_pnl_pct
+        net_unrealized = gross_unrealized - commission
+        
+        equity += net_unrealized
     return equity
 
 
